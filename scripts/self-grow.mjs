@@ -14,6 +14,8 @@ const ALLOWED_ROOT_FILES = new Set(["README.md", "package.json"]);
 const ALLOWED_DIRS = ["src/", "app/", "components/", "docs/", "public/"];
 const FORBIDDEN_PATHS = [".env", "package-lock.json"];
 const FORBIDDEN_PREFIXES = [".git/", "node_modules/", ".next/", ".vercel/"];
+const MAX_GENERATE_ATTEMPTS = 3;
+const RAW_RESPONSE_LOG_LIMIT = 1800;
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -129,7 +131,7 @@ async function assertOllamaModel() {
   }
 }
 
-function buildPrompt(context) {
+function buildPrompt(context, attempt = 1) {
   return `You are the local AI growth engine for SpawnZero.
 
 SpawnZero philosophy:
@@ -150,6 +152,13 @@ Rules:
 - Do not delete files.
 - Only use create or update actions.
 - Return JSON only. No Markdown, no commentary.
+- Do not use markdown.
+- Do not wrap in code fences.
+- Return a single JSON object only.
+- No comments.
+- No trailing commas.
+- Every file content must be a JSON string.
+- Escape newlines as needed through JSON serialization.
 
 Allowed paths:
 - src/**
@@ -182,22 +191,51 @@ JSON shape:
   ]
 }
 
-Repository context:
+${attempt > 1 ? "Your previous response was invalid JSON. Return only valid JSON matching the schema.\n\n" : ""}Repository context:
 ${JSON.stringify(context, null, 2)}
 `;
 }
 
 async function generateChange(context) {
+  let lastError = null;
+  let lastRawResponse = "";
+
+  for (let attempt = 1; attempt <= MAX_GENERATE_ATTEMPTS; attempt += 1) {
+    const rawResponse = await requestOllamaChange(context, attempt);
+    lastRawResponse = rawResponse;
+    logRawResponse(rawResponse, attempt);
+
+    try {
+      const change = parseJsonResponse(rawResponse);
+      validateChange(change);
+      return change;
+    } catch (error) {
+      lastError = error;
+      console.log(`Ollama response attempt ${attempt} was invalid: ${formatError(error)}`);
+      if (attempt < MAX_GENERATE_ATTEMPTS) {
+        console.log("Retrying with stricter JSON instructions.");
+      }
+    }
+  }
+
+  throw new Error(
+    `Ollama did not return valid self-grow JSON after ${MAX_GENERATE_ATTEMPTS} attempts. Last error: ${formatError(
+      lastError,
+    )}\nRaw response excerpt:\n${truncateForLog(lastRawResponse)}`,
+  );
+}
+
+async function requestOllamaChange(context, attempt) {
   const response = await fetch(`${OLLAMA_HOST}/api/generate`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: OLLAMA_MODEL,
-      prompt: buildPrompt(context),
+      prompt: buildPrompt(context, attempt),
       stream: false,
       format: "json",
       options: {
-        temperature: 0.2,
+        temperature: 0.1,
       },
     }),
   });
@@ -207,25 +245,41 @@ async function generateChange(context) {
   }
 
   const data = await response.json();
-  return parseJsonResponse(data.response ?? "");
+  return typeof data.response === "string" ? data.response : JSON.stringify(data.response ?? "");
 }
 
 function parseJsonResponse(text) {
-  const cleaned = text
-    .replace(/<think>[\s\S]*?<\/think>/gi, "")
-    .replace(/```json|```/gi, "")
-    .trim();
+  const candidate = extractJsonCandidate(text);
+  return JSON.parse(candidate);
+}
 
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    const start = cleaned.indexOf("{");
-    const end = cleaned.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      return JSON.parse(cleaned.slice(start, end + 1));
-    }
-    throw new Error(`Model response was not valid JSON:\n${text}`);
+function extractJsonCandidate(text) {
+  const withoutThinking = String(text ?? "").replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  const fenced = withoutThinking.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  const source = (fenced ? fenced[1] : withoutThinking).trim();
+  const start = source.indexOf("{");
+  const end = source.lastIndexOf("}");
+
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error("response did not contain a complete JSON object");
   }
+
+  return source.slice(start, end + 1).trim();
+}
+
+function logRawResponse(rawResponse, attempt) {
+  console.log(`Ollama raw response attempt ${attempt} excerpt:`);
+  console.log(truncateForLog(rawResponse));
+}
+
+function truncateForLog(value) {
+  const text = String(value ?? "").replace(/\r/g, "");
+  if (text.length <= RAW_RESPONSE_LOG_LIMIT) return text;
+  return `${text.slice(0, RAW_RESPONSE_LOG_LIMIT)}\n... [truncated ${text.length - RAW_RESPONSE_LOG_LIMIT} chars]`;
+}
+
+function formatError(error) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function normalizeRepoPath(path) {
@@ -233,16 +287,47 @@ function normalizeRepoPath(path) {
 }
 
 function validateChange(change) {
-  if (!change || typeof change !== "object") throw new Error("change must be an object");
-  if (!ALLOWED_TYPES.has(change.type)) throw new Error(`invalid change type: ${change.type}`);
-  if (!change.title || typeof change.title !== "string") throw new Error("title is required");
-  if (!change.summary || typeof change.summary !== "string") throw new Error("summary is required");
-  if (!Array.isArray(change.files) || change.files.length === 0) throw new Error("files must be a non-empty array");
+  if (!change || typeof change !== "object" || Array.isArray(change)) {
+    throw new Error("change must be a JSON object");
+  }
+
+  const allowedKeys = new Set(["title", "type", "summary", "files"]);
+  for (const key of Object.keys(change)) {
+    if (!allowedKeys.has(key)) throw new Error(`unexpected top-level key: ${key}`);
+  }
+
+  if (typeof change.type !== "string" || !ALLOWED_TYPES.has(change.type)) {
+    throw new Error(`invalid change type: ${change.type}`);
+  }
+  if (typeof change.title !== "string" || change.title.trim().length === 0) {
+    throw new Error("title must be a non-empty string");
+  }
+  if (typeof change.summary !== "string" || change.summary.trim().length === 0) {
+    throw new Error("summary must be a non-empty string");
+  }
+  if (!Array.isArray(change.files) || change.files.length === 0) {
+    throw new Error("files must be a non-empty array");
+  }
   if (change.files.length > 3) throw new Error("self-grow may modify at most 3 files");
 
-  for (const file of change.files) {
-    if (!file || typeof file !== "object") throw new Error("each file entry must be an object");
-    file.path = normalizeRepoPath(file.path ?? "");
+  const seenPaths = new Set();
+  for (const [index, file] of change.files.entries()) {
+    if (!file || typeof file !== "object" || Array.isArray(file)) {
+      throw new Error(`files[${index}] must be an object`);
+    }
+
+    const allowedFileKeys = new Set(["path", "action", "content"]);
+    for (const key of Object.keys(file)) {
+      if (!allowedFileKeys.has(key)) throw new Error(`unexpected key in files[${index}]: ${key}`);
+    }
+
+    if (typeof file.path !== "string" || file.path.trim().length === 0) {
+      throw new Error(`files[${index}].path must be a non-empty string`);
+    }
+    file.path = normalizeRepoPath(file.path.trim());
+    if (seenPaths.has(file.path)) throw new Error(`duplicate file path: ${file.path}`);
+    seenPaths.add(file.path);
+
     if (!["create", "update"].includes(file.action)) throw new Error(`invalid action for ${file.path}`);
     if (typeof file.content !== "string") throw new Error(`content must be a string for ${file.path}`);
     validatePath(file.path);
@@ -404,5 +489,4 @@ main().catch((error) => {
   console.error(error instanceof Error ? error.message : error);
   process.exit(1);
 });
-
 

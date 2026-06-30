@@ -1,0 +1,27 @@
+﻿# This workflow requires a local self-hosted runner with Ollama. Do not run AI generation on GitHub-hosted runners.
+name: Self Grow
+
+on:
+  workflow_dispatch:
+
+jobs:
+  grow:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run self-grow
+        run: npm run grow

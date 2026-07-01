@@ -228,6 +228,10 @@ function safetyRulesText() {
 - Do not add external dependencies unless truly necessary.
 - Keep the project buildable.
 - Do not delete files.
+- Do not push directly to main.
+- Do not create fake contact or business content.
+- Do not create generic contact, pricing, careers, or testimonials pages.
+- Only create buildable code.
 - Only use create or update actions.
 - Do not use markdown.
 - Do not wrap in code fences.
@@ -277,9 +281,7 @@ function buildPrompt(context, attempt = 1) {
   return `You are the local AI growth engine for this repository.
 
 Core instruction:
-Look at the current repo state and failure logs, then independently decide one small change that moves this project to its next step. What to build is your decision. The change must actually build in the current repo.
-
-Do not wait for a human product direction, feature direction, service idea, design preference, or marketing angle. Choose the change yourself from the current repository state.
+Look at the current repository state. Decide one small next change. Keep it buildable. Follow safety rules. Return valid JSON only.
 
 ${safetyRulesText()}
 

@@ -40,19 +40,28 @@ function run(command, args, options = {}) {
 }
 
 function runCapture(command, args) {
+  const commandText = `${command} ${args.join(" ")}`;
   const result = spawnSync(command, args, {
     cwd: ROOT,
     encoding: "utf8",
     stdio: "pipe",
-    shell: false,
+    shell: true,
+    windowsHide: true,
+    maxBuffer: 1024 * 1024 * 20,
   });
 
+  const stdout = result.stdout ?? "";
+  const stderr = [result.stderr ?? "", result.error ? result.error.message : ""].filter(Boolean).join("\n");
+  const exitCode = typeof result.status === "number" ? result.status : 1;
+  const combinedOutput = [stdout, stderr].filter(Boolean).join("\n");
+
   return {
-    ok: result.status === 0,
-    command: `${command} ${args.join(" ")}`,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? "",
-    status: result.status,
+    ok: exitCode === 0,
+    command: commandText,
+    exitCode,
+    stdout,
+    stderr,
+    combinedOutput,
   };
 }
 
@@ -199,7 +208,15 @@ function importRulesText() {
 - If you create a component and import it, both files must be included in the same JSON proposal.
 - Do not import from @/src/*.
 - Do not include .tsx extensions in imports.
-- For a simple page, define all types and data inline.`;
+- For a simple page, define all types and data inline.
+- When creating page.tsx, prefer a static server component.
+- Do not use useState or useEffect in generated pages.
+- Do not import React hooks in generated pages.
+- Do not import custom types or components in generated pages.
+- Do not import Metadata unless necessary.
+- For simple pages, use no imports at all.
+- Keep generated page content self-contained.
+- If interactivity is needed, use "use client" and keep it minimal, but avoid interactivity for early self-grow attempts.`;
 }
 
 function safetyRulesText() {
@@ -315,14 +332,17 @@ ${jsonAttempt > 1 ? "Your previous response was invalid JSON. Return only valid 
 Previous proposal title: ${previousProposal.title}
 Previous proposal summary: ${previousProposal.summary}
 Failed command: ${failure.command}
+Exit code: ${failure.exitCode ?? "unknown"}
+Generated file list:
+${proposalFileList(previousProposal)}
 stdout excerpt:
 ${truncateForLimit(failure.stdout ?? "", FAILURE_LOG_LIMIT)}
 
 stderr excerpt:
 ${truncateForLimit(failure.stderr ?? "", FAILURE_LOG_LIMIT)}
 
-Combined error log excerpt:
-${truncateForLimit(failure.log, FAILURE_LOG_LIMIT)}
+Combined output excerpt:
+${truncateForLimit(failure.combinedOutput ?? failure.log, FAILURE_LOG_LIMIT)}
 
 Current diff excerpt:
 ${truncateForLimit(diff || "No diff was available.", DIFF_LOG_LIMIT)}
@@ -346,7 +366,13 @@ function formatPreviousFailures(previousFailures) {
   if (!previousFailures.length) return "- None yet.";
   return previousFailures
     .map((failure) => [
-      `- Attempt ${failure.attempt}: ${failure.reason}`,
+      `- Attempt ${failure.attempt}: ${failure.proposalType}: ${failure.proposalTitle}`,
+      `  - Files: ${failure.files}`,
+      `  - Failed command: ${failure.command}`,
+      `  - Exit code: ${failure.exitCode ?? "unknown"}`,
+      `  - Detected failure type: ${failure.detectedFailureType}`,
+      `  - stdout: ${failure.stdoutExcerpt}`,
+      `  - stderr: ${failure.stderrExcerpt}`,
       ...failure.bannedPatterns.map((pattern) => `  - ${pattern}`),
     ].join("\n"))
     .join("\n");
@@ -356,14 +382,42 @@ function rememberFailure(memory, attempt, proposal, failure) {
   const patterns = deriveBannedPatterns(proposal, failure);
   memory.previousFailures.push({
     attempt,
-    reason: `${failure.command}: ${firstLine(failure.log)}`,
+    proposalTitle: proposal.title,
+    proposalType: proposal.type,
+    files: proposalFileList(proposal),
+    command: failure.command,
+    exitCode: failure.exitCode,
+    stdoutExcerpt: outputExcerpt(failure.stdout),
+    stderrExcerpt: outputExcerpt(failure.stderr),
+    detectedFailureType: failure.detectedFailureType ?? detectFailureType(failure.combinedOutput ?? failure.log ?? ""),
+    reason: `${failure.command}: ${firstLine(failure.combinedOutput ?? failure.log)}`,
     bannedPatterns: patterns,
   });
 }
 
+function detectFailureType(output) {
+  const text = String(output ?? "").toLowerCase();
+  if (/missing .*import|module not found|cannot find module|can\'t resolve/.test(text)) return "missing import";
+  if (/react hook|hooks can only be called|invalid hook call|usestate|useeffect/.test(text)) return "invalid React hook usage";
+  if (/typescript|type error|ts\d{4}|is not assignable|does not exist on type/.test(text)) return "TypeScript error";
+  if (/eslint|lint|react\/|@typescript-eslint|no-unused-vars|rules of hooks/.test(text)) return "ESLint rule violation";
+  if (/server component|client component|use client|metadata|next\.js/.test(text)) return "Next.js server/client component error";
+  return "unknown validation failure";
+}
+
+function outputExcerpt(value) {
+  const text = truncateForLimit(value ?? "", 12000).trim();
+  return text || "empty stdout/stderr";
+}
+
+function printValidationFailure(result) {
+  console.log(`${result.command} failed with exit code ${result.exitCode}`);
+  console.log(`stdout tail:\n${outputExcerpt(result.stdout)}`);
+  console.log(`stderr tail:\n${outputExcerpt(result.stderr)}`);
+}
 function deriveBannedPatterns(proposal, failure) {
   const patterns = new Set();
-  const log = failure.log ?? "";
+  const log = failure.combinedOutput ?? failure.log ?? "";
 
   if (log.includes("@/src/")) {
     patterns.add("Do not use @/src/* imports.");
@@ -435,6 +489,7 @@ async function requestOllama(prompt) {
       format: "json",
       options: {
         temperature: 0.1,
+        num_predict: 8192,
       },
     }),
   });
@@ -655,21 +710,24 @@ function runValidation() {
 
 function runValidationCommand(command, args) {
   const commandName = `${command} ${args.join(" ")}`;
-  console.log(`Running ${commandName}`);
+  console.log(`Starting ${commandName}`);
   const result = runCapture(command, args);
+  console.log(`Finished ${commandName} with exit code ${result.exitCode}`);
   if (result.ok) {
     console.log(`${commandName} passed`);
     return { ok: true, command: commandName };
   }
 
-  console.log(`${commandName} failed`);
+  printValidationFailure(result);
   return {
     ok: false,
     command: commandName,
+    exitCode: result.exitCode,
     stdout: result.stdout,
     stderr: result.stderr,
-    log: [result.stdout, result.stderr].filter(Boolean).join("\n").trim(),
-    status: result.status,
+    combinedOutput: result.combinedOutput,
+    log: result.combinedOutput,
+    detectedFailureType: detectFailureType(result.combinedOutput),
   };
 }
 
@@ -707,9 +765,12 @@ async function runProposalWithRepair(context) {
     } catch (error) {
       lastFailure = {
         command: "preflight",
+        exitCode: 1,
         stdout: "",
         stderr: formatError(error),
+        combinedOutput: formatError(error),
         log: formatError(error),
+        detectedFailureType: detectFailureType(formatError(error)),
       };
       console.log(`preflight failed: ${lastFailure.log}`);
       rememberFailure(memory, attempt + 1, proposal, lastFailure);
@@ -779,7 +840,7 @@ ${status || "clean"}`);
   console.log(`git status --short after rollback:
 ${status || "clean"}`);
   console.log(`raw failure summary:
-${truncateForLimit(failure?.log ?? "No failure log captured.", FAILURE_LOG_LIMIT)}`);
+${truncateForLimit(failure?.combinedOutput ?? failure?.log ?? "No failure log captured.", FAILURE_LOG_LIMIT)}`);
   return status;
 }
 

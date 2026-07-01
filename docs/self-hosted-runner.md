@@ -39,3 +39,10 @@ npm run grow
 ```
 
 The generated change should be pushed to a new branch and submitted as a pull request. It should not be pushed directly to `main`.
+
+
+## GitHub workflow permissions
+
+For self-grow to push an `auto/grow-*` branch and create a pull request, open GitHub repository Settings -> Actions -> General and set Workflow permissions to Read and write permissions. Also enable Allow GitHub Actions to create and approve pull requests.
+
+This is a public repository. Do not commit tokens, secrets, API keys, or local environment files.

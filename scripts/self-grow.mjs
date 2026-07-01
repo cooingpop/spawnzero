@@ -858,6 +858,15 @@ function sanitizeMessage(title) {
     .slice(0, 80);
 }
 
+function debugGitHubPushContext() {
+  console.log("self-grow git push context:");
+  console.log(run("git", ["remote", "-v"]));
+  console.log(`current branch: ${run("git", ["branch", "--show-current"])}`);
+  console.log(`GITHUB_ACTOR: ${process.env.GITHUB_ACTOR ?? ""}`);
+  console.log(`GITHUB_REPOSITORY: ${process.env.GITHUB_REPOSITORY ?? ""}`);
+  console.log(`GH_TOKEN present: ${Boolean(process.env.GH_TOKEN)}`);
+  console.log(`GITHUB_TOKEN present: ${Boolean(process.env.GITHUB_TOKEN)}`);
+}
 function createBranchCommitAndPush(change) {
   const branch = `auto/grow-${timestamp()}`;
   const message = sanitizeMessage(change.title);
@@ -867,6 +876,7 @@ function createBranchCommitAndPush(change) {
   run("git", ["checkout", "-b", branch]);
   run("git", ["add", "--", ...files]);
   run("git", ["commit", "-m", commitMessage]);
+  debugGitHubPushContext();
   run("git", ["push", "-u", "origin", branch], { stdio: "inherit" });
 
   console.log(`Branch: ${branch}`);
@@ -878,13 +888,19 @@ function createPullRequest(change, branchInfo, validation) {
   const ghAvailable = tryRun("gh", ["--version"]);
   if (!ghAvailable.ok) {
     console.log("GitHub CLI is not installed. Branch pushed without PR creation.");
+    printManualPullRequestInstructions(branchInfo.branch);
     return null;
   }
 
+  const hasToken = Boolean(process.env.GH_TOKEN || process.env.GITHUB_TOKEN);
   const auth = tryRun("gh", ["auth", "status"]);
   if (!auth.ok) {
-    console.log("GitHub CLI is not authenticated. Branch pushed without PR creation.");
-    return null;
+    console.log("GitHub CLI auth status failed. Continuing if GH_TOKEN/GITHUB_TOKEN is available.");
+    if (!hasToken) {
+      console.log("No GH_TOKEN or GITHUB_TOKEN was found. Branch pushed without PR creation.");
+      printManualPullRequestInstructions(branchInfo.branch);
+      return null;
+    }
   }
 
   const title = `${SELF_GROW_TAG} ${change.type}: ${branchInfo.message}`;
@@ -908,8 +924,14 @@ Safety:
 - Generated through scripts/self-grow.mjs
 `;
 
-  const pr = run("gh", ["pr", "create", "--base", "main", "--head", branchInfo.branch, "--title", title, "--body", body]);
-  const prUrl = pr.split(/\r?\n/).find((line) => line.startsWith("http")) ?? pr;
+  const pr = tryRun("gh", ["pr", "create", "--base", "main", "--head", branchInfo.branch, "--title", title, "--body", body]);
+  if (!pr.ok) {
+    console.log(`PR creation failed after branch push: ${pr.stderr || pr.stdout}`);
+    printManualPullRequestInstructions(branchInfo.branch);
+    return null;
+  }
+
+  const prUrl = pr.stdout.split(/\r?\n/).find((line) => line.startsWith("http")) ?? pr.stdout;
 
   const labels = tryRun("gh", ["pr", "edit", prUrl, "--add-label", "self-grow,qwen3,automated-change"]);
   if (!labels.ok) {
@@ -923,6 +945,12 @@ Safety:
   console.log(`PR URL: ${prUrl}`);
   console.log(`Auto-merge disabled. PR: ${prUrl}`);
   return prUrl;
+}
+
+function printManualPullRequestInstructions(branch) {
+  const repository = process.env.GITHUB_REPOSITORY || "cooingpop/spawnzero";
+  console.log("Create the pull request manually if needed:");
+  console.log(`https://github.com/${repository}/compare/main...${branch}?expand=1`);
 }
 
 async function main() {

@@ -257,15 +257,12 @@ Forbidden paths:
 }
 
 function buildPrompt(context, attempt = 1) {
-  return `You are the local AI growth engine for SpawnZero.
+  return `You are the local AI growth engine for this repository.
 
-SpawnZero philosophy:
-This project is not about a human planning a service and asking AI to implement it. The experiment observes what a local AI chooses to build when given only a minimal safe execution environment and repository context.
+Core instruction:
+Look at the current repo state and failure logs, then independently decide one small change that moves this project to its next step. What to build is your decision. The change must actually build in the current repo.
 
-Your task:
-Read the current repository state and decide exactly one small next change that would make SpawnZero a more meaningful project.
-
-Do not follow human service ideas, specific app directions, personal design taste, marketing direction, or long-term product planning. Decide from the repo state and experiment purpose only.
+Do not wait for a human product direction, feature direction, service idea, design preference, or marketing angle. Choose the change yourself from the current repository state.
 
 ${safetyRulesText()}
 
@@ -290,7 +287,6 @@ function buildRepairPrompt({
   repairAttempt,
   jsonAttempt,
   previousFailures,
-  bannedProposalTopics,
 }) {
   return `Your previous change failed validation.
 Analyze the error log and return a corrected JSON proposal.
@@ -299,8 +295,6 @@ Return only valid JSON.
 The new proposal must be self-contained.
 Do not reference files, types, aliases, or components that do not exist.
 If a type is needed, define it in the same file.
-Avoid creating a generic blog/demo page unless it directly supports SpawnZero.
-Prefer changes related to SpawnZero's self-growing experiment, observability, history, or public explanation.
 Keep the change small.
 Max 3 files.
 No secrets.
@@ -317,14 +311,17 @@ Repair attempt: ${repairAttempt}
 Previous failed pattern memory:
 ${formatPreviousFailures(previousFailures)}
 
-Banned proposal topics in this run:
-${formatBannedTopics(bannedProposalTopics)}
-
-${bannedProposalTopics.includes("blog") ? "Do not propose another blog feature in this run. Choose a smaller SpawnZero-related change.\n" : ""}${jsonAttempt > 1 ? "Your previous response was invalid JSON. Return only valid JSON matching the schema.\n\n" : ""}
+${jsonAttempt > 1 ? "Your previous response was invalid JSON. Return only valid JSON matching the schema.\n\n" : ""}
 Previous proposal title: ${previousProposal.title}
 Previous proposal summary: ${previousProposal.summary}
 Failed command: ${failure.command}
-Error log excerpt:
+stdout excerpt:
+${truncateForLimit(failure.stdout ?? "", FAILURE_LOG_LIMIT)}
+
+stderr excerpt:
+${truncateForLimit(failure.stderr ?? "", FAILURE_LOG_LIMIT)}
+
+Combined error log excerpt:
 ${truncateForLimit(failure.log, FAILURE_LOG_LIMIT)}
 
 Current diff excerpt:
@@ -355,22 +352,6 @@ function formatPreviousFailures(previousFailures) {
     .join("\n");
 }
 
-function formatBannedTopics(bannedProposalTopics) {
-  if (!bannedProposalTopics.length) return "- None yet.";
-  return bannedProposalTopics.map((topic) => `- ${topic}`).join("\n");
-}
-
-function hasBlogTopic(proposal) {
-  const haystack = [
-    proposal.title,
-    proposal.summary,
-    ...proposal.files.map((file) => `${file.path}\n${file.content.slice(0, 500)}`),
-  ]
-    .join("\n")
-    .toLowerCase();
-  return /\bblog\b|\/blog\b/.test(haystack);
-}
-
 function rememberFailure(memory, attempt, proposal, failure) {
   const patterns = deriveBannedPatterns(proposal, failure);
   memory.previousFailures.push({
@@ -378,10 +359,6 @@ function rememberFailure(memory, attempt, proposal, failure) {
     reason: `${failure.command}: ${firstLine(failure.log)}`,
     bannedPatterns: patterns,
   });
-
-  if (hasBlogTopic(proposal) && !memory.bannedProposalTopics.includes("blog")) {
-    memory.bannedProposalTopics.push("blog");
-  }
 }
 
 function deriveBannedPatterns(proposal, failure) {
@@ -582,6 +559,7 @@ function preflightProposal(change) {
 
 function validateImports(change) {
   const generatedPaths = new Set(change.files.map((file) => file.path));
+  const packageNames = getPackageNames();
   const importPattern = /(?:^|\n)\s*import\s+(?:[\s\S]*?\s+from\s+)?["']([^"']+)["']/g;
 
   for (const file of change.files) {
@@ -605,10 +583,38 @@ function validateImports(change) {
         if (!modulePathExists(target, generatedPaths)) {
           throw new Error(`missing relative import in ${file.path}: ${specifier}`);
         }
+      } else {
+        validateExternalImport(file.path, specifier, packageNames);
       }
       match = importPattern.exec(file.content);
     }
   }
+}
+
+function getPackageNames() {
+  const packageJson = JSON.parse(readText(resolve(ROOT, "package.json")) || "{}");
+  return new Set([
+    ...Object.keys(packageJson.dependencies ?? {}),
+    ...Object.keys(packageJson.devDependencies ?? {}),
+    ...Object.keys(packageJson.peerDependencies ?? {}),
+    ...Object.keys(packageJson.optionalDependencies ?? {}),
+  ]);
+}
+
+function validateExternalImport(filePath, specifier, packageNames) {
+  if (specifier.startsWith("node:")) return;
+  const packageName = packageNameFromSpecifier(specifier);
+  if (!packageNames.has(packageName)) {
+    throw new Error(`external import not listed in package.json in ${filePath}: ${specifier}`);
+  }
+}
+
+function packageNameFromSpecifier(specifier) {
+  if (specifier.startsWith("@")) {
+    const [scope, name] = specifier.split("/");
+    return `${scope}/${name ?? ""}`;
+  }
+  return specifier.split("/")[0];
 }
 
 function modulePathExists(basePath, generatedPaths) {
@@ -660,6 +666,8 @@ function runValidationCommand(command, args) {
   return {
     ok: false,
     command: commandName,
+    stdout: result.stdout,
+    stderr: result.stderr,
     log: [result.stdout, result.stderr].filter(Boolean).join("\n").trim(),
     status: result.status,
   };
@@ -681,7 +689,6 @@ async function runProposalWithRepair(context) {
   let lastProposalTitle = proposal.title;
   const memory = {
     previousFailures: [],
-    bannedProposalTopics: [],
   };
 
   for (let attempt = 0; attempt <= MAX_REPAIR_ATTEMPTS; attempt += 1) {
@@ -700,6 +707,8 @@ async function runProposalWithRepair(context) {
     } catch (error) {
       lastFailure = {
         command: "preflight",
+        stdout: "",
+        stderr: formatError(error),
         log: formatError(error),
       };
       console.log(`preflight failed: ${lastFailure.log}`);
@@ -713,7 +722,6 @@ async function runProposalWithRepair(context) {
         diff: "No diff was available because preflight failed before file application.",
         repairAttempt: attempt + 1,
         previousFailures: memory.previousFailures,
-        bannedProposalTopics: memory.bannedProposalTopics,
       });
       continue;
     }
@@ -739,7 +747,6 @@ async function runProposalWithRepair(context) {
       diff,
       repairAttempt: attempt + 1,
       previousFailures: memory.previousFailures,
-      bannedProposalTopics: memory.bannedProposalTopics,
     });
   }
 
@@ -766,8 +773,6 @@ function finalizeFailedRun({ failure, memory, totalAttempts, lastProposalTitle }
 ${formatPreviousFailures(memory.previousFailures)}`);
   console.log(`banned paths/imports:
 ${formatPreviousFailures(memory.previousFailures)}`);
-  console.log(`banned proposal topics:
-${formatBannedTopics(memory.bannedProposalTopics)}`);
   console.log(`last proposal title: ${lastProposalTitle}`);
   console.log(`rollback status:
 ${status || "clean"}`);

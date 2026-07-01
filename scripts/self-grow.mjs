@@ -1,5 +1,5 @@
-﻿import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, resolve, sep } from "node:path";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { dirname, posix, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const ROOT = process.cwd();
@@ -12,10 +12,14 @@ const SELF_GROW_TAG = "[self-grow:qwen3]";
 const ALLOWED_TYPES = new Set(["feat", "fix", "refactor", "docs", "style", "chore", "test", "ci"]);
 const ALLOWED_ROOT_FILES = new Set(["README.md", "package.json"]);
 const ALLOWED_DIRS = ["src/", "app/", "components/", "docs/", "public/"];
+const ALLOWED_DIFF_PATHS = ["src", "docs", "README.md", "package.json", "public", "app", "components"];
 const FORBIDDEN_PATHS = [".env", "package-lock.json"];
 const FORBIDDEN_PREFIXES = [".git/", "node_modules/", ".next/", ".vercel/"];
 const MAX_GENERATE_ATTEMPTS = 3;
+const MAX_REPAIR_ATTEMPTS = 2;
 const RAW_RESPONSE_LOG_LIMIT = 1800;
+const FAILURE_LOG_LIMIT = 5000;
+const DIFF_LOG_LIMIT = 7000;
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -33,7 +37,7 @@ function run(command, args, options = {}) {
   return (result.stdout ?? "").trim();
 }
 
-function tryRun(command, args) {
+function runCapture(command, args) {
   const result = spawnSync(command, args, {
     cwd: ROOT,
     encoding: "utf8",
@@ -43,8 +47,19 @@ function tryRun(command, args) {
 
   return {
     ok: result.status === 0,
-    stdout: (result.stdout ?? "").trim(),
-    stderr: (result.stderr ?? "").trim(),
+    command: `${command} ${args.join(" ")}`,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    status: result.status,
+  };
+}
+
+function tryRun(command, args) {
+  const result = runCapture(command, args);
+  return {
+    ok: result.ok,
+    stdout: result.stdout.trim(),
+    stderr: result.stderr.trim(),
   };
 }
 
@@ -63,6 +78,16 @@ function assertRepoReady() {
   if (status) {
     throw new Error(`working tree must be clean before self-grow runs:\n${status}`);
   }
+}
+
+function resetToCleanBaseline() {
+  run("git", ["reset", "--hard"], { stdio: "inherit" });
+  run("git", ["clean", "-fd"], { stdio: "inherit" });
+  const status = run("git", ["status", "--short"]);
+  if (status) {
+    throw new Error(`working tree is not clean after rollback:\n${status}`);
+  }
+  return status;
 }
 
 function readText(path, maxChars = 6000) {
@@ -108,6 +133,18 @@ function collectContext() {
   };
 }
 
+function summarizeContext(context) {
+  return {
+    branch: context.branch,
+    recentCommits: context.recentCommits,
+    packageScripts: context.packageScripts,
+    srcTree: context.srcTree,
+    appTree: context.appTree,
+    docsTree: context.docsTree,
+    openPullRequests: context.openPullRequests,
+  };
+}
+
 function getOpenPullRequests() {
   const ghAvailable = tryRun("gh", ["--version"]);
   if (!ghAvailable.ok) return "GitHub CLI not available";
@@ -131,18 +168,8 @@ async function assertOllamaModel() {
   }
 }
 
-function buildPrompt(context, attempt = 1) {
-  return `You are the local AI growth engine for SpawnZero.
-
-SpawnZero philosophy:
-This project is not about a human planning a service and asking AI to implement it. The experiment observes what a local AI chooses to build when given only a minimal safe execution environment and repository context.
-
-Your task:
-Read the current repository state and decide exactly one small next change that would make SpawnZero a more meaningful project.
-
-Do not follow human service ideas, specific app directions, personal design taste, marketing direction, or long-term product planning. Decide from the repo state and experiment purpose only.
-
-Rules:
+function safetyRulesText() {
+  return `Safety rules:
 - Make only one small change.
 - Modify at most 3 files.
 - Do not create or modify secrets, .env files, tokens, or API keys.
@@ -151,16 +178,33 @@ Rules:
 - Keep the project buildable.
 - Do not delete files.
 - Only use create or update actions.
-- Return JSON only. No Markdown, no commentary.
 - Do not use markdown.
 - Do not wrap in code fences.
 - Return a single JSON object only.
 - No comments.
 - No trailing commas.
 - Every file content must be a JSON string.
-- Escape newlines as needed through JSON serialization.
+- Escape newlines as needed through JSON serialization.`;
+}
 
-Allowed paths:
+function schemaText() {
+  return `JSON shape:
+{
+  "title": "short change title",
+  "type": "feat|fix|refactor|docs|style|chore|test|ci",
+  "summary": "what will change",
+  "files": [
+    {
+      "path": "relative/path",
+      "action": "create|update",
+      "content": "full file content"
+    }
+  ]
+}`;
+}
+
+function allowedPathsText() {
+  return `Allowed paths:
 - src/**
 - app/**
 - components/**
@@ -175,35 +219,91 @@ Forbidden paths:
 - node_modules/**
 - .next/**
 - .vercel/**
-- package-lock.json
-
-JSON shape:
-{
-  "title": "short change title",
-  "type": "feat|fix|refactor|docs|style|chore|test|ci",
-  "summary": "what will change",
-  "files": [
-    {
-      "path": "relative/path",
-      "action": "create|update",
-      "content": "full file content"
-    }
-  ]
+- package-lock.json`;
 }
+
+function buildPrompt(context, attempt = 1) {
+  return `You are the local AI growth engine for SpawnZero.
+
+SpawnZero philosophy:
+This project is not about a human planning a service and asking AI to implement it. The experiment observes what a local AI chooses to build when given only a minimal safe execution environment and repository context.
+
+Your task:
+Read the current repository state and decide exactly one small next change that would make SpawnZero a more meaningful project.
+
+Do not follow human service ideas, specific app directions, personal design taste, marketing direction, or long-term product planning. Decide from the repo state and experiment purpose only.
+
+${safetyRulesText()}
+
+${allowedPathsText()}
+
+${schemaText()}
 
 ${attempt > 1 ? "Your previous response was invalid JSON. Return only valid JSON matching the schema.\n\n" : ""}Repository context:
 ${JSON.stringify(context, null, 2)}
 `;
 }
 
-async function generateChange(context) {
+function buildRepairPrompt({ context, previousProposal, failure, diff, repairAttempt, jsonAttempt }) {
+  return `Your previous change failed validation.
+Analyze the error log and return a corrected JSON proposal.
+Do not explain.
+Return only valid JSON.
+The new proposal must be self-contained.
+Do not reference files, types, aliases, or components that do not exist.
+If a type is needed, define it in the same file.
+Avoid creating a generic blog/demo page unless it directly supports SpawnZero.
+Prefer changes related to SpawnZero's self-growing experiment, observability, history, or public explanation.
+Keep the change small.
+Max 3 files.
+No secrets.
+No .env changes.
+Do not use markdown.
+Do not wrap in code fences.
+Return a single JSON object only.
+No comments.
+No trailing commas.
+Every file content must be a JSON string.
+Escape newlines as needed through JSON serialization.
+
+Repair attempt: ${repairAttempt}
+${jsonAttempt > 1 ? "Your previous response was invalid JSON. Return only valid JSON matching the schema.\n\n" : ""}
+Previous proposal title: ${previousProposal.title}
+Previous proposal summary: ${previousProposal.summary}
+Failed command: ${failure.command}
+Error log excerpt:
+${truncateForLimit(failure.log, FAILURE_LOG_LIMIT)}
+
+Current diff excerpt:
+${truncateForLimit(diff || "No diff was available.", DIFF_LOG_LIMIT)}
+
+Repo context summary:
+${JSON.stringify(summarizeContext(context), null, 2)}
+
+${safetyRulesText()}
+
+${allowedPathsText()}
+
+${schemaText()}
+`;
+}
+
+async function generateInitialProposal(context) {
+  return generateProposal((attempt) => buildPrompt(context, attempt), "initial proposal");
+}
+
+async function generateRepairProposal(repairInput) {
+  return generateProposal((attempt) => buildRepairPrompt({ ...repairInput, jsonAttempt: attempt }), `repair proposal ${repairInput.repairAttempt}`);
+}
+
+async function generateProposal(promptFactory, label) {
   let lastError = null;
   let lastRawResponse = "";
 
   for (let attempt = 1; attempt <= MAX_GENERATE_ATTEMPTS; attempt += 1) {
-    const rawResponse = await requestOllamaChange(context, attempt);
+    const rawResponse = await requestOllama(promptFactory(attempt));
     lastRawResponse = rawResponse;
-    logRawResponse(rawResponse, attempt);
+    logRawResponse(rawResponse, `${label} / JSON attempt ${attempt}`);
 
     try {
       const change = parseJsonResponse(rawResponse);
@@ -211,7 +311,7 @@ async function generateChange(context) {
       return change;
     } catch (error) {
       lastError = error;
-      console.log(`Ollama response attempt ${attempt} was invalid: ${formatError(error)}`);
+      console.log(`Ollama response for ${label} attempt ${attempt} was invalid: ${formatError(error)}`);
       if (attempt < MAX_GENERATE_ATTEMPTS) {
         console.log("Retrying with stricter JSON instructions.");
       }
@@ -219,19 +319,19 @@ async function generateChange(context) {
   }
 
   throw new Error(
-    `Ollama did not return valid self-grow JSON after ${MAX_GENERATE_ATTEMPTS} attempts. Last error: ${formatError(
+    `Ollama did not return valid self-grow JSON for ${label} after ${MAX_GENERATE_ATTEMPTS} attempts. Last error: ${formatError(
       lastError,
     )}\nRaw response excerpt:\n${truncateForLog(lastRawResponse)}`,
   );
 }
 
-async function requestOllamaChange(context, attempt) {
+async function requestOllama(prompt) {
   const response = await fetch(`${OLLAMA_HOST}/api/generate`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: OLLAMA_MODEL,
-      prompt: buildPrompt(context, attempt),
+      prompt,
       stream: false,
       format: "json",
       options: {
@@ -267,15 +367,19 @@ function extractJsonCandidate(text) {
   return source.slice(start, end + 1).trim();
 }
 
-function logRawResponse(rawResponse, attempt) {
-  console.log(`Ollama raw response attempt ${attempt} excerpt:`);
+function logRawResponse(rawResponse, label) {
+  console.log(`Ollama raw response excerpt (${label}):`);
   console.log(truncateForLog(rawResponse));
 }
 
 function truncateForLog(value) {
+  return truncateForLimit(value, RAW_RESPONSE_LOG_LIMIT);
+}
+
+function truncateForLimit(value, limit) {
   const text = String(value ?? "").replace(/\r/g, "");
-  if (text.length <= RAW_RESPONSE_LOG_LIMIT) return text;
-  return `${text.slice(0, RAW_RESPONSE_LOG_LIMIT)}\n... [truncated ${text.length - RAW_RESPONSE_LOG_LIMIT} chars]`;
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n... [truncated ${text.length - limit} chars]`;
 }
 
 function formatError(error) {
@@ -343,44 +447,170 @@ function validatePath(path) {
   if (!isAllowed) throw new Error(`path is not allowed: ${path}`);
 }
 
-function applyFiles(files) {
-  const snapshots = [];
-
-  for (const file of files) {
-    const absolute = resolve(ROOT, file.path);
-    if (!absolute.startsWith(ROOT + sep)) throw new Error(`resolved path escaped repo: ${file.path}`);
-
-    const existed = existsSync(absolute);
-    snapshots.push({ path: absolute, existed, content: existed ? readFileSync(absolute, "utf8") : null });
-    mkdirSync(dirname(absolute), { recursive: true });
-    writeFileSync(absolute, file.content, "utf8");
-  }
-
-  return snapshots;
+function preflightProposal(change) {
+  validateChange(change);
+  validateImports(change);
 }
 
-function restoreSnapshots(snapshots) {
-  for (const snapshot of snapshots.reverse()) {
-    if (snapshot.existed) {
-      writeFileSync(snapshot.path, snapshot.content, "utf8");
-    } else if (existsSync(snapshot.path)) {
-      rmSync(snapshot.path, { force: true });
+function validateImports(change) {
+  const generatedPaths = new Set(change.files.map((file) => file.path));
+  const importPattern = /(?:^|\n)\s*import\s+(?:[\s\S]*?\s+from\s+)?["']([^"']+)["']/g;
+
+  for (const file of change.files) {
+    importPattern.lastIndex = 0;
+    let match = importPattern.exec(file.content);
+    while (match) {
+      const specifier = match[1];
+      if (specifier.startsWith("@/")) {
+        const target = normalizeRepoPath(`src/${specifier.slice(2)}`);
+        if (!modulePathExists(target, generatedPaths)) {
+          throw new Error(`missing aliased import in ${file.path}: ${specifier}`);
+        }
+      } else if (specifier.startsWith(".")) {
+        const target = normalizeRepoPath(posix.normalize(posix.join(posix.dirname(file.path), specifier)));
+        if (!modulePathExists(target, generatedPaths)) {
+          throw new Error(`missing relative import in ${file.path}: ${specifier}`);
+        }
+      }
+      match = importPattern.exec(file.content);
     }
   }
 }
 
-function runValidationOrRestore(snapshots) {
-  try {
-    run("npm", ["run", "lint"], { stdio: "inherit" });
-    run("npm", ["run", "build"], { stdio: "inherit" });
-    return {
-      lint: "npm run lint: passed",
-      build: "npm run build: passed",
-    };
-  } catch (error) {
-    restoreSnapshots(snapshots);
-    throw error;
+function modulePathExists(basePath, generatedPaths) {
+  return modulePathCandidates(basePath).some((candidate) => generatedPaths.has(candidate) || existsSync(resolve(ROOT, candidate)));
+}
+
+function modulePathCandidates(basePath) {
+  const extensions = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".json", ".css"];
+  const candidates = [];
+  for (const extension of extensions) candidates.push(`${basePath}${extension}`);
+  for (const extension of extensions.slice(1)) candidates.push(`${basePath}/index${extension}`);
+  return candidates.map(normalizeRepoPath);
+}
+
+function applyFiles(files) {
+  for (const file of files) {
+    const absolute = resolve(ROOT, file.path);
+    if (!absolute.startsWith(ROOT + sep)) throw new Error(`resolved path escaped repo: ${file.path}`);
+
+    mkdirSync(dirname(absolute), { recursive: true });
+    writeFileSync(absolute, file.content, "utf8");
   }
+}
+
+function runValidation() {
+  const lint = runValidationCommand("npm", ["run", "lint"]);
+  if (!lint.ok) return lint;
+
+  const build = runValidationCommand("npm", ["run", "build"]);
+  if (!build.ok) return build;
+
+  return {
+    ok: true,
+    lint: "npm run lint: passed",
+    build: "npm run build: passed",
+  };
+}
+
+function runValidationCommand(command, args) {
+  const commandName = `${command} ${args.join(" ")}`;
+  console.log(`Running ${commandName}`);
+  const result = runCapture(command, args);
+  if (result.ok) {
+    console.log(`${commandName} passed`);
+    return { ok: true, command: commandName };
+  }
+
+  console.log(`${commandName} failed`);
+  return {
+    ok: false,
+    command: commandName,
+    log: [result.stdout, result.stderr].filter(Boolean).join("\n").trim(),
+    status: result.status,
+  };
+}
+
+function collectAllowedDiff() {
+  const diff = tryRun("git", ["diff", "--", ...ALLOWED_DIFF_PATHS]);
+  return diff.stdout || diff.stderr || "";
+}
+
+function proposalFileList(change) {
+  return change.files.map((file) => `${file.action}:${file.path}`).join(", ");
+}
+
+async function runProposalWithRepair(context) {
+  let proposal = await generateInitialProposal(context);
+  let lastFailure = null;
+
+  for (let attempt = 0; attempt <= MAX_REPAIR_ATTEMPTS; attempt += 1) {
+    const isRepair = attempt > 0;
+    const attemptLabel = isRepair ? `repair attempt ${attempt}` : "initial attempt";
+    console.log(`Self-grow ${attemptLabel}`);
+    console.log(`Proposal: ${proposal.type}: ${proposal.title}`);
+    console.log(`Files: ${proposalFileList(proposal)}`);
+
+    resetToCleanBaseline();
+
+    try {
+      preflightProposal(proposal);
+    } catch (error) {
+      lastFailure = {
+        command: "preflight",
+        log: formatError(error),
+      };
+      console.log(`preflight failed: ${lastFailure.log}`);
+
+      if (attempt === MAX_REPAIR_ATTEMPTS) break;
+      proposal = await generateRepairProposal({
+        context,
+        previousProposal: proposal,
+        failure: lastFailure,
+        diff: "No diff was available because preflight failed before file application.",
+        repairAttempt: attempt + 1,
+      });
+      continue;
+    }
+
+    applyFiles(proposal.files);
+    const validation = runValidation();
+    if (validation.ok) {
+      console.log("self-grow validation passed");
+      return { change: proposal, validation };
+    }
+
+    const diff = collectAllowedDiff();
+    lastFailure = validation;
+
+    if (attempt === MAX_REPAIR_ATTEMPTS) break;
+
+    console.log(`Preparing repair attempt ${attempt + 1}`);
+    proposal = await generateRepairProposal({
+      context,
+      previousProposal: proposal,
+      failure: validation,
+      diff,
+      repairAttempt: attempt + 1,
+    });
+  }
+
+  const statusAfterRollback = finalizeFailedRun(lastFailure);
+  throw new Error(
+    `self-grow failed after ${MAX_REPAIR_ATTEMPTS} repair attempts. Last failure: ${lastFailure?.command ?? "unknown"}\n${truncateForLimit(
+      lastFailure?.log ?? "No failure log captured.",
+      FAILURE_LOG_LIMIT,
+    )}\nGit status after rollback:\n${statusAfterRollback || "clean"}`,
+  );
+}
+
+function finalizeFailedRun(failure) {
+  console.log("Final self-grow failure. Rolling back all generated changes.");
+  resetToCleanBaseline();
+  const status = run("git", ["status", "--short"]);
+  console.log(`git status --short after rollback:\n${status || "clean"}`);
+  console.log(`raw failure summary:\n${truncateForLimit(failure?.log ?? "No failure log captured.", FAILURE_LOG_LIMIT)}`);
+  return status;
 }
 
 function timestamp() {
@@ -408,6 +638,8 @@ function createBranchCommitAndPush(change) {
   run("git", ["commit", "-m", commitMessage]);
   run("git", ["push", "-u", "origin", branch], { stdio: "inherit" });
 
+  console.log(`Branch: ${branch}`);
+  console.log(`Commit: ${commitMessage}`);
   return { branch, message, commitMessage };
 }
 
@@ -454,17 +686,11 @@ Safety:
   }
 
   if (ENABLE_AUTO_MERGE) {
-    const checks = tryRun("gh", ["pr", "checks", prUrl, "--watch", "--required"]);
-    if (checks.ok) {
-      const merge = tryRun("gh", ["pr", "merge", prUrl, "--squash", "--delete-branch"]);
-      if (!merge.ok) console.log(`Auto-merge failed: ${merge.stderr || merge.stdout}`);
-    } else {
-      console.log(`Required checks did not pass. Auto-merge skipped: ${checks.stderr || checks.stdout}`);
-    }
-  } else {
-    console.log(`Auto-merge disabled. PR: ${prUrl}`);
+    console.log("ENABLE_AUTO_MERGE=true is set, but self-grow keeps auto-merge disabled by policy. PR only.");
   }
 
+  console.log(`PR URL: ${prUrl}`);
+  console.log(`Auto-merge disabled. PR: ${prUrl}`);
   return prUrl;
 }
 
@@ -474,11 +700,7 @@ async function main() {
   const context = collectContext();
   await assertOllamaModel();
 
-  const change = await generateChange(context);
-  validateChange(change);
-
-  const snapshots = applyFiles(change.files);
-  const validation = runValidationOrRestore(snapshots);
+  const { change, validation } = await runProposalWithRepair(context);
   const branchInfo = createBranchCommitAndPush(change);
   const prUrl = createPullRequest(change, branchInfo, validation);
 
@@ -489,4 +711,3 @@ main().catch((error) => {
   console.error(error instanceof Error ? error.message : error);
   process.exit(1);
 });
-

@@ -20,6 +20,8 @@ const MAX_REPAIR_ATTEMPTS = 2;
 const RAW_RESPONSE_LOG_LIMIT = 1800;
 const FAILURE_LOG_LIMIT = 5000;
 const DIFF_LOG_LIMIT = 7000;
+const SRC_APP_PAGE = "src/app/page.tsx";
+const ROOT_APP_PAGE = "app/page.tsx";
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -135,6 +137,7 @@ function collectContext() {
 
 function summarizeContext(context) {
   return {
+    projectStructure: projectStructureSummary(),
     branch: context.branch,
     recentCommits: context.recentCommits,
     packageScripts: context.packageScripts,
@@ -166,6 +169,37 @@ async function assertOllamaModel() {
   if (!hasModel) {
     throw new Error(`Ollama model ${OLLAMA_MODEL} was not found. Run: ollama pull ${OLLAMA_MODEL}`);
   }
+}
+
+function projectStructureSummary() {
+  return {
+    router: "Next.js App Router",
+    sourceLayout: existsSync(resolve(ROOT, "src/app")) ? "src/app" : "app",
+    homePage: existsSync(resolve(ROOT, SRC_APP_PAGE)) ? SRC_APP_PAGE : ROOT_APP_PAGE,
+    rootAppDirectoryExists: existsSync(resolve(ROOT, "app")),
+    srcAppDirectoryExists: existsSync(resolve(ROOT, "src/app")),
+    instruction: "Use src/app/page.tsx for the home page. Create new routes under src/app/<route>/page.tsx.",
+  };
+}
+
+function projectStructureRulesText() {
+  return `Project structure rules:
+- This repository uses the src/app based Next.js App Router structure.
+- Use src/app/page.tsx for the existing home page.
+- Do not create or update app/page.tsx when src/app/page.tsx exists.
+- Do not modify app/** unless the app directory already exists in the repository.
+- Create new pages as src/app/<route>/page.tsx.
+- The existing home page is src/app/page.tsx.`;
+}
+
+function importRulesText() {
+  return `Import rules:
+- Prefer zero imports.
+- For generated pages, avoid importing custom components or custom types.
+- If you create a component and import it, both files must be included in the same JSON proposal.
+- Do not import from @/src/*.
+- Do not include .tsx extensions in imports.
+- For a simple page, define all types and data inline.`;
 }
 
 function safetyRulesText() {
@@ -235,6 +269,10 @@ Do not follow human service ideas, specific app directions, personal design tast
 
 ${safetyRulesText()}
 
+${projectStructureRulesText()}
+
+${importRulesText()}
+
 ${allowedPathsText()}
 
 ${schemaText()}
@@ -244,7 +282,16 @@ ${JSON.stringify(context, null, 2)}
 `;
 }
 
-function buildRepairPrompt({ context, previousProposal, failure, diff, repairAttempt, jsonAttempt }) {
+function buildRepairPrompt({
+  context,
+  previousProposal,
+  failure,
+  diff,
+  repairAttempt,
+  jsonAttempt,
+  previousFailures,
+  bannedProposalTopics,
+}) {
   return `Your previous change failed validation.
 Analyze the error log and return a corrected JSON proposal.
 Do not explain.
@@ -267,7 +314,13 @@ Every file content must be a JSON string.
 Escape newlines as needed through JSON serialization.
 
 Repair attempt: ${repairAttempt}
-${jsonAttempt > 1 ? "Your previous response was invalid JSON. Return only valid JSON matching the schema.\n\n" : ""}
+Previous failed pattern memory:
+${formatPreviousFailures(previousFailures)}
+
+Banned proposal topics in this run:
+${formatBannedTopics(bannedProposalTopics)}
+
+${bannedProposalTopics.includes("blog") ? "Do not propose another blog feature in this run. Choose a smaller SpawnZero-related change.\n" : ""}${jsonAttempt > 1 ? "Your previous response was invalid JSON. Return only valid JSON matching the schema.\n\n" : ""}
 Previous proposal title: ${previousProposal.title}
 Previous proposal summary: ${previousProposal.summary}
 Failed command: ${failure.command}
@@ -282,10 +335,79 @@ ${JSON.stringify(summarizeContext(context), null, 2)}
 
 ${safetyRulesText()}
 
+${projectStructureRulesText()}
+
+${importRulesText()}
+
 ${allowedPathsText()}
 
 ${schemaText()}
 `;
+}
+
+function formatPreviousFailures(previousFailures) {
+  if (!previousFailures.length) return "- None yet.";
+  return previousFailures
+    .map((failure) => [
+      `- Attempt ${failure.attempt}: ${failure.reason}`,
+      ...failure.bannedPatterns.map((pattern) => `  - ${pattern}`),
+    ].join("\n"))
+    .join("\n");
+}
+
+function formatBannedTopics(bannedProposalTopics) {
+  if (!bannedProposalTopics.length) return "- None yet.";
+  return bannedProposalTopics.map((topic) => `- ${topic}`).join("\n");
+}
+
+function hasBlogTopic(proposal) {
+  const haystack = [
+    proposal.title,
+    proposal.summary,
+    ...proposal.files.map((file) => `${file.path}\n${file.content.slice(0, 500)}`),
+  ]
+    .join("\n")
+    .toLowerCase();
+  return /\bblog\b|\/blog\b/.test(haystack);
+}
+
+function rememberFailure(memory, attempt, proposal, failure) {
+  const patterns = deriveBannedPatterns(proposal, failure);
+  memory.previousFailures.push({
+    attempt,
+    reason: `${failure.command}: ${firstLine(failure.log)}`,
+    bannedPatterns: patterns,
+  });
+
+  if (hasBlogTopic(proposal) && !memory.bannedProposalTopics.includes("blog")) {
+    memory.bannedProposalTopics.push("blog");
+  }
+}
+
+function deriveBannedPatterns(proposal, failure) {
+  const patterns = new Set();
+  const log = failure.log ?? "";
+
+  if (log.includes("@/src/")) {
+    patterns.add("Do not use @/src/* imports.");
+    for (const match of log.matchAll(/@\/src\/[^\s'"`]+/g)) patterns.add(`Do not use ${match[0]}`);
+  }
+  if (/\.tsx(?:\s|$|;|,)/i.test(log)) patterns.add("Do not include .tsx extensions in imports.");
+  if (log.includes(ROOT_APP_PAGE)) patterns.add(`Do not create or update ${ROOT_APP_PAGE}; use ${SRC_APP_PAGE}.`);
+  if (/missing (?:aliased|relative) import/.test(log)) {
+    patterns.add("Do not import files that are not included in this JSON proposal.");
+    patterns.add("Prefer zero imports and define simple page data inline.");
+  }
+
+  for (const file of proposal.files) {
+    if (file.path.startsWith("app/")) patterns.add("Do not use app/** paths in this repo; use src/app/**.");
+  }
+
+  return [...patterns];
+}
+
+function firstLine(value) {
+  return String(value ?? "").split(/\r?\n/).find(Boolean) ?? "No failure detail captured.";
 }
 
 async function generateInitialProposal(context) {
@@ -440,6 +562,12 @@ function validateChange(change) {
 
 function validatePath(path) {
   if (!path || path.startsWith("/") || path.includes("..")) throw new Error(`unsafe path: ${path}`);
+  if (path === ROOT_APP_PAGE && existsSync(resolve(ROOT, SRC_APP_PAGE))) {
+    throw new Error(`hard banned path: ${ROOT_APP_PAGE}; this repository uses ${SRC_APP_PAGE}`);
+  }
+  if (path.startsWith("app/") && !existsSync(resolve(ROOT, "app"))) {
+    throw new Error(`hard banned path: ${path}; root app directory does not exist, use src/app instead`);
+  }
   if (FORBIDDEN_PATHS.includes(path)) throw new Error(`forbidden path: ${path}`);
   if (FORBIDDEN_PREFIXES.some((prefix) => path.startsWith(prefix))) throw new Error(`forbidden path: ${path}`);
 
@@ -461,6 +589,12 @@ function validateImports(change) {
     let match = importPattern.exec(file.content);
     while (match) {
       const specifier = match[1];
+      if (specifier.startsWith("@/src/")) {
+        throw new Error(`hard banned import in ${file.path}: ${specifier}; do not import from @/src/*`);
+      }
+      if (/\.tsx$/i.test(specifier)) {
+        throw new Error(`hard banned import in ${file.path}: ${specifier}; do not include .tsx extensions in imports`);
+      }
       if (specifier.startsWith("@/")) {
         const target = normalizeRepoPath(`src/${specifier.slice(2)}`);
         if (!modulePathExists(target, generatedPaths)) {
@@ -543,10 +677,18 @@ function proposalFileList(change) {
 async function runProposalWithRepair(context) {
   let proposal = await generateInitialProposal(context);
   let lastFailure = null;
+  let totalAttempts = 0;
+  let lastProposalTitle = proposal.title;
+  const memory = {
+    previousFailures: [],
+    bannedProposalTopics: [],
+  };
 
   for (let attempt = 0; attempt <= MAX_REPAIR_ATTEMPTS; attempt += 1) {
     const isRepair = attempt > 0;
     const attemptLabel = isRepair ? `repair attempt ${attempt}` : "initial attempt";
+    totalAttempts += 1;
+    lastProposalTitle = proposal.title;
     console.log(`Self-grow ${attemptLabel}`);
     console.log(`Proposal: ${proposal.type}: ${proposal.title}`);
     console.log(`Files: ${proposalFileList(proposal)}`);
@@ -561,6 +703,7 @@ async function runProposalWithRepair(context) {
         log: formatError(error),
       };
       console.log(`preflight failed: ${lastFailure.log}`);
+      rememberFailure(memory, attempt + 1, proposal, lastFailure);
 
       if (attempt === MAX_REPAIR_ATTEMPTS) break;
       proposal = await generateRepairProposal({
@@ -569,6 +712,8 @@ async function runProposalWithRepair(context) {
         failure: lastFailure,
         diff: "No diff was available because preflight failed before file application.",
         repairAttempt: attempt + 1,
+        previousFailures: memory.previousFailures,
+        bannedProposalTopics: memory.bannedProposalTopics,
       });
       continue;
     }
@@ -582,6 +727,7 @@ async function runProposalWithRepair(context) {
 
     const diff = collectAllowedDiff();
     lastFailure = validation;
+    rememberFailure(memory, attempt + 1, proposal, lastFailure);
 
     if (attempt === MAX_REPAIR_ATTEMPTS) break;
 
@@ -592,24 +738,43 @@ async function runProposalWithRepair(context) {
       failure: validation,
       diff,
       repairAttempt: attempt + 1,
+      previousFailures: memory.previousFailures,
+      bannedProposalTopics: memory.bannedProposalTopics,
     });
   }
 
-  const statusAfterRollback = finalizeFailedRun(lastFailure);
+  const statusAfterRollback = finalizeFailedRun({
+    failure: lastFailure,
+    memory,
+    totalAttempts,
+    lastProposalTitle,
+  });
   throw new Error(
-    `self-grow failed after ${MAX_REPAIR_ATTEMPTS} repair attempts. Last failure: ${lastFailure?.command ?? "unknown"}\n${truncateForLimit(
+    `self-grow failed after ${MAX_REPAIR_ATTEMPTS} repair attempts. Total attempts: ${totalAttempts}. Last proposal: ${lastProposalTitle}. Last failure: ${lastFailure?.command ?? "unknown"}\n${truncateForLimit(
       lastFailure?.log ?? "No failure log captured.",
       FAILURE_LOG_LIMIT,
     )}\nGit status after rollback:\n${statusAfterRollback || "clean"}`,
   );
 }
 
-function finalizeFailedRun(failure) {
+function finalizeFailedRun({ failure, memory, totalAttempts, lastProposalTitle }) {
   console.log("Final self-grow failure. Rolling back all generated changes.");
   resetToCleanBaseline();
   const status = run("git", ["status", "--short"]);
-  console.log(`git status --short after rollback:\n${status || "clean"}`);
-  console.log(`raw failure summary:\n${truncateForLimit(failure?.log ?? "No failure log captured.", FAILURE_LOG_LIMIT)}`);
+  console.log(`total attempts: ${totalAttempts}`);
+  console.log(`failed patterns:
+${formatPreviousFailures(memory.previousFailures)}`);
+  console.log(`banned paths/imports:
+${formatPreviousFailures(memory.previousFailures)}`);
+  console.log(`banned proposal topics:
+${formatBannedTopics(memory.bannedProposalTopics)}`);
+  console.log(`last proposal title: ${lastProposalTitle}`);
+  console.log(`rollback status:
+${status || "clean"}`);
+  console.log(`git status --short after rollback:
+${status || "clean"}`);
+  console.log(`raw failure summary:
+${truncateForLimit(failure?.log ?? "No failure log captured.", FAILURE_LOG_LIMIT)}`);
   return status;
 }
 
